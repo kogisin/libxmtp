@@ -32,7 +32,7 @@ use tracing_subscriber::{
 };
 use valuable::Valuable;
 use xmtp_api::ApiIdentifier;
-use xmtp_api_d14n::compat::D14nClient;
+use xmtp_api_d14n::queries::D14nClient;
 use xmtp_api_grpc::grpc_client::GrpcClient;
 use xmtp_api_grpc::{grpc_api_helper::Client as ClientV3, GrpcError};
 use xmtp_proto::traits::ApiClientError;
@@ -40,17 +40,14 @@ use xmtp_proto::traits::ApiClientError;
 use xmtp_common::time::now_ns;
 use xmtp_content_types::{text::TextCodec, ContentCodec};
 use xmtp_cryptography::signature::IdentifierValidationError;
-use xmtp_cryptography::{
-    signature::{RecoverableSignature, SignatureError},
-    utils::rng,
-};
+use xmtp_cryptography::{signature::SignatureError, utils::rng};
 use xmtp_db::group::GroupQueryArgs;
 use xmtp_db::group_message::{GroupMessageKind, MsgQueryArgs};
 use xmtp_db::{
     group_message::StoredGroupMessage, EncryptedMessageStore, EncryptionKey, StorageError,
     StorageOption,
 };
-use xmtp_id::associations::unverified::{UnverifiedRecoverableEcdsaSignature, UnverifiedSignature};
+use xmtp_id::associations::unverified::UnverifiedSignature;
 use xmtp_id::associations::{AssociationError, AssociationState, Identifier, MemberKind};
 use xmtp_mls::groups::device_sync::DeviceSyncContent;
 use xmtp_mls::groups::scoped_client::ScopedGroupClient;
@@ -198,7 +195,7 @@ impl InboxOwner for Wallet {
         }
     }
 
-    fn sign(&self, text: &str) -> Result<RecoverableSignature, SignatureError> {
+    fn sign(&self, text: &str) -> Result<UnverifiedSignature, SignatureError> {
         match self {
             Wallet::LocalWallet(w) => w.sign(text),
         }
@@ -485,7 +482,7 @@ async fn main() -> color_eyre::eyre::Result<()> {
         Commands::ListHistorySyncMessages {} => {
             let provider = client.mls_provider()?;
             client.sync_welcomes(&provider).await?;
-            let group = client.get_sync_group(provider.conn_ref())?;
+            let group = client.get_sync_group(&provider)?;
             let group_id_str = hex::encode(group.group_id.clone());
             group.sync().await?;
             let messages = group.find_messages(&MsgQueryArgs {
@@ -542,8 +539,8 @@ async fn create_client<C: XmtpApi + Clone + 'static>(
     let mut builder = builder.api_client(grpc);
 
     builder = match (cli.testnet, &cli.env) {
-        (false, Env::Local) => builder.history_sync_url(MessageHistoryUrls::LOCAL_ADDRESS),
-        (false, Env::Dev) => builder.history_sync_url(MessageHistoryUrls::DEV_ADDRESS),
+        (false, Env::Local) => builder.device_sync_server_url(MessageHistoryUrls::LOCAL_ADDRESS),
+        (false, Env::Dev) => builder.device_sync_server_url(MessageHistoryUrls::DEV_ADDRESS),
         _ => builder,
     };
 
@@ -585,12 +582,7 @@ where
     )
     .await?;
     let mut signature_request = client.identity().signature_request().unwrap();
-    let sig_bytes: Vec<u8> = w
-        .sign(signature_request.signature_text().as_str())
-        .unwrap()
-        .into();
-    let signature =
-        UnverifiedSignature::RecoverableEcdsa(UnverifiedRecoverableEcdsaSignature::new(sig_bytes));
+    let signature = w.sign(signature_request.signature_text().as_str()).unwrap();
     signature_request
         .add_signature(signature, client.scw_verifier())
         .await

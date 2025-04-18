@@ -1,6 +1,7 @@
 use crate::identity::{FfiCollectionExt, FfiCollectionTryExt, FfiIdentifier};
 pub use crate::inbox_owner::SigningError;
 use crate::logger::init_logger;
+use crate::worker::FfiSyncWorkerMode;
 use crate::{FfiSubscribeError, GenericError};
 use prost::Message;
 use std::{collections::HashMap, convert::TryInto, sync::Arc};
@@ -64,6 +65,10 @@ use xmtp_proto::xmtp::mls::message_contents::content_types::{
     MultiRemoteAttachment, ReactionV2, RemoteAttachmentInfo,
 };
 use xmtp_proto::xmtp::mls::message_contents::{DeviceSyncKind, EncodedContent};
+
+#[cfg(test)]
+mod test_utils;
+
 pub type RustXmtpClient = MlsClient<TonicApiClient>;
 
 #[derive(uniffi::Object, Clone)]
@@ -121,6 +126,7 @@ pub async fn create_client(
     nonce: u64,
     legacy_signed_private_key_proto: Option<Vec<u8>>,
     history_sync_url: Option<String>,
+    sync_worker_mode: Option<FfiSyncWorkerMode>,
 ) -> Result<Arc<FfiXmtpClient>, GenericError> {
     let ident = account_identifier.clone();
     init_logger();
@@ -160,7 +166,11 @@ pub async fn create_client(
         .store(store);
 
     if let Some(url) = &history_sync_url {
-        builder = builder.history_sync_url(url);
+        builder = builder.device_sync_server_url(url);
+    }
+
+    if let Some(sync_worker_mode) = sync_worker_mode {
+        builder = builder.device_sync_worker_mode(sync_worker_mode.into());
     }
 
     let xmtp_client = builder.build().await?;
@@ -520,10 +530,17 @@ impl FfiXmtpClient {
             &public_key,
         )?)
     }
-}
 
-#[uniffi::export(async_runtime = "tokio")]
-impl FfiXmtpClient {
+    pub async fn sync_preferences(&self) -> Result<u64, GenericError> {
+        let inner = self.inner_client.as_ref();
+        let provider = inner.mls_provider()?;
+        let num_groups_synced = inner
+            .sync_all_welcomes_and_history_sync_groups(&provider)
+            .await?;
+
+        Ok(num_groups_synced as u64)
+    }
+
     pub fn signature_request(&self) -> Option<Arc<FfiSignatureRequest>> {
         let scw_verifier = self.inner_client.scw_verifier().clone();
         self.inner_client
@@ -1520,8 +1537,8 @@ impl FfiConversations {
 impl FfiConversations {
     pub fn get_sync_group(&self) -> Result<FfiConversation, GenericError> {
         let inner = self.inner_client.as_ref();
-        let conn = inner.store().conn()?;
-        let sync_group = inner.get_sync_group(&conn)?;
+        let provider = inner.mls_provider()?;
+        let sync_group = inner.get_sync_group(&provider)?;
         Ok(sync_group.into())
     }
 }
@@ -2745,39 +2762,6 @@ impl FfiGroupPermissions {
 
 #[cfg(test)]
 mod tests {
-    use futures::future::join_all;
-    use passkey::{
-        authenticator::{Authenticator, UserCheck, UserValidationMethod},
-        client::{Client, DefaultClientData},
-        types::{ctap2::*, rand::random_vec, webauthn::*, Bytes, Passkey},
-    };
-    use public_suffix::PublicSuffixList;
-
-    struct PkUserValidationMethod {}
-    #[async_trait::async_trait]
-    impl UserValidationMethod for PkUserValidationMethod {
-        type PasskeyItem = Passkey;
-        async fn check_user<'a>(
-            &self,
-            _credential: Option<&'a Passkey>,
-            presence: bool,
-            verification: bool,
-        ) -> Result<UserCheck, Ctap2Error> {
-            Ok(UserCheck {
-                presence,
-                verification,
-            })
-        }
-
-        fn is_verification_enabled(&self) -> Option<bool> {
-            Some(true)
-        }
-
-        fn is_presence_enabled(&self) -> bool {
-            true
-        }
-    }
-
     use super::{
         create_client, FfiConsentCallback, FfiMessage, FfiMessageCallback, FfiPreferenceCallback,
         FfiPreferenceUpdate, FfiXmtpClient,
@@ -2787,6 +2771,8 @@ mod tests {
         encode_multi_remote_attachment, encode_reaction, get_inbox_id_for_identifier,
         identity::{FfiIdentifier, FfiIdentifierKind},
         inbox_owner::{FfiInboxOwner, IdentityValidationError, SigningError},
+        mls::test_utils::{LocalBuilder, LocalTester},
+        worker::FfiSyncWorkerMode,
         FfiConsent, FfiConsentEntityType, FfiConsentState, FfiContentType, FfiConversation,
         FfiConversationCallback, FfiConversationMessageKind, FfiCreateDMOptions,
         FfiCreateGroupOptions, FfiDirection, FfiGroupPermissionsOptions,
@@ -2797,10 +2783,10 @@ mod tests {
         GenericError,
     };
     use ethers::utils::hex;
+    use futures::future::join_all;
     use prost::Message;
     use std::{
         collections::HashMap,
-        ops::Deref,
         sync::{
             atomic::{AtomicU32, Ordering},
             Arc, Mutex,
@@ -2818,17 +2804,16 @@ mod tests {
         remote_attachment::RemoteAttachmentCodec, reply::ReplyCodec, text::TextCodec,
         transaction_reference::TransactionReferenceCodec, ContentCodec,
     };
-    use xmtp_cryptography::{signature::RecoverableSignature, utils::rng};
+    use xmtp_cryptography::utils::rng;
     use xmtp_db::EncryptionKey;
-    use xmtp_id::associations::{
-        test_utils::WalletTestExt,
-        unverified::{UnverifiedRecoverableEcdsaSignature, UnverifiedSignature},
-    };
+    use xmtp_id::associations::{test_utils::WalletTestExt, unverified::UnverifiedSignature};
     use xmtp_mls::{
-        groups::{scoped_client::LocalScopedGroupClient, GroupError},
+        groups::{
+            device_sync::handle::SyncMetric, scoped_client::LocalScopedGroupClient, GroupError,
+        },
+        utils::tester::{PasskeyUser, Tester},
         InboxOwner,
     };
-
     use xmtp_proto::xmtp::mls::message_contents::{
         content_types::{ReactionAction, ReactionSchema, ReactionV2},
         ContentTypeId, EncodedContent,
@@ -2837,11 +2822,11 @@ mod tests {
     const HISTORY_SYNC_URL: &str = "http://localhost:5558";
 
     #[derive(Clone)]
-    pub struct LocalWalletInboxOwner {
+    pub struct FfiWalletInboxOwner {
         wallet: xmtp_cryptography::utils::LocalWallet,
     }
 
-    impl LocalWalletInboxOwner {
+    impl FfiWalletInboxOwner {
         pub fn with_wallet(wallet: xmtp_cryptography::utils::LocalWallet) -> Self {
             Self { wallet }
         }
@@ -2857,7 +2842,7 @@ mod tests {
         }
     }
 
-    impl FfiInboxOwner for LocalWalletInboxOwner {
+    impl FfiInboxOwner for FfiWalletInboxOwner {
         fn get_identifier(&self) -> Result<FfiIdentifier, IdentityValidationError> {
             let ident = self
                 .wallet
@@ -2869,9 +2854,12 @@ mod tests {
         fn sign(&self, text: String) -> Result<Vec<u8>, SigningError> {
             let recoverable_signature =
                 self.wallet.sign(&text).map_err(|_| SigningError::Generic)?;
-            match recoverable_signature {
-                RecoverableSignature::Eip191Signature(signature_bytes) => Ok(signature_bytes),
-            }
+
+            let bytes = match recoverable_signature {
+                UnverifiedSignature::RecoverableEcdsa(sig) => sig.signature_bytes().to_vec(),
+                _ => unreachable!("Eth wallets only provide ecdsa signatures"),
+            };
+            Ok(bytes)
         }
     }
 
@@ -2989,12 +2977,12 @@ mod tests {
         [2u8; 32]
     }
 
-    async fn register_client(inbox_owner: &LocalWalletInboxOwner, client: &FfiXmtpClient) {
+    async fn register_client(inbox_owner: &FfiWalletInboxOwner, client: &FfiXmtpClient) {
         register_client_no_panic(inbox_owner, client).await.unwrap()
     }
 
     async fn register_client_no_panic(
-        inbox_owner: &LocalWalletInboxOwner,
+        inbox_owner: &FfiWalletInboxOwner,
         client: &FfiXmtpClient,
     ) -> Result<(), GenericError> {
         let signature_request = client.signature_request().unwrap();
@@ -3014,21 +3002,20 @@ mod tests {
     async fn new_test_client_with_wallet(
         wallet: xmtp_cryptography::utils::LocalWallet,
     ) -> Arc<FfiXmtpClient> {
-        new_test_client_with_wallet_and_history_sync_url(wallet, None).await
-    }
-
-    async fn new_test_client_with_wallet_and_history(
-        wallet: xmtp_cryptography::utils::LocalWallet,
-    ) -> Arc<FfiXmtpClient> {
-        new_test_client_with_wallet_and_history_sync_url(wallet, Some(HISTORY_SYNC_URL.to_string()))
-            .await
+        new_test_client_with_wallet_and_history_sync_url(
+            wallet,
+            None,
+            Some(FfiSyncWorkerMode::Disabled),
+        )
+        .await
     }
 
     async fn new_test_client_with_wallet_and_history_sync_url(
         wallet: xmtp_cryptography::utils::LocalWallet,
         history_sync_url: Option<String>,
+        sync_worker_mode: Option<FfiSyncWorkerMode>,
     ) -> Arc<FfiXmtpClient> {
-        let ffi_inbox_owner = LocalWalletInboxOwner::with_wallet(wallet);
+        let ffi_inbox_owner = FfiWalletInboxOwner::with_wallet(wallet);
         let ident = ffi_inbox_owner.identifier();
         let nonce = 1;
         let inbox_id = ident.inbox_id(nonce).unwrap();
@@ -3044,6 +3031,7 @@ mod tests {
             nonce,
             None,
             history_sync_url,
+            sync_worker_mode,
         )
         .await
         .unwrap();
@@ -3059,7 +3047,7 @@ mod tests {
         wallet: xmtp_cryptography::utils::LocalWallet,
         history_sync_url: Option<String>,
     ) -> Result<Arc<FfiXmtpClient>, GenericError> {
-        let ffi_inbox_owner = LocalWalletInboxOwner::with_wallet(wallet);
+        let ffi_inbox_owner = FfiWalletInboxOwner::with_wallet(wallet);
         let ident = ffi_inbox_owner.identifier();
         let nonce = 1;
         let inbox_id = ident.inbox_id(nonce).unwrap();
@@ -3075,6 +3063,7 @@ mod tests {
             nonce,
             None,
             history_sync_url,
+            None,
         )
         .await?;
 
@@ -3086,155 +3075,29 @@ mod tests {
         Ok(client)
     }
 
-    type PasskeyCredential = PublicKeyCredential<AuthenticatorAttestationResponse>;
-    type PasskeyClient = Client<Option<Passkey>, PkUserValidationMethod, PublicSuffixList>;
-
-    #[allow(dead_code)]
-    struct PasskeyUser {
-        pk_cred: PasskeyCredential,
-        pk_client: PasskeyClient,
-        client: Arc<FfiXmtpClient>,
-    }
-
-    impl Deref for PasskeyUser {
-        type Target = Arc<FfiXmtpClient>;
-        fn deref(&self) -> &Self::Target {
-            &self.client
-        }
-    }
-
-    async fn new_passkey_client() -> PasskeyUser {
-        let origin = url::Url::parse("https://xmtp.chat").expect("Should parse");
-        let parameters_from_rp = PublicKeyCredentialParameters {
-            ty: PublicKeyCredentialType::PublicKey,
-            alg: coset::iana::Algorithm::ES256,
-        };
-        let pk_user_entity = PublicKeyCredentialUserEntity {
-            id: random_vec(32).into(),
-            display_name: "Alex Passkey".into(),
-            name: "apk@example.org".into(),
-        };
-        let pk_auth_store: Option<Passkey> = None;
-        let pk_aaguid = Aaguid::new_empty();
-        let pk_user_validation_method = PkUserValidationMethod {};
-        let pk_auth = Authenticator::new(pk_aaguid, pk_auth_store, pk_user_validation_method);
-        let mut pk_client = Client::new(pk_auth);
-
-        let request = CredentialCreationOptions {
-            public_key: PublicKeyCredentialCreationOptions {
-                rp: PublicKeyCredentialRpEntity {
-                    id: None, // Leaving the ID as None means use the effective domain
-                    name: origin.domain().unwrap().into(),
-                },
-                user: pk_user_entity,
-                // We're not passing a challenge here because we don't care about the credential and the user_entity behind it (for now).
-                // It's guaranteed to be unique, and that's good enough for us.
-                // All we care about is if that unique credential signs below.
-                challenge: Bytes::from(vec![]),
-                pub_key_cred_params: vec![parameters_from_rp],
-                timeout: None,
-                exclude_credentials: None,
-                authenticator_selection: None,
-                hints: None,
-                attestation: AttestationConveyancePreference::None,
-                attestation_formats: None,
-                extensions: None,
-            },
-        };
-
-        // Now create the credential.
-        let pk_cred = pk_client
-            .register(origin.clone(), request, DefaultClientData)
-            .await
-            .unwrap();
-
-        let public_key = pk_cred.response.public_key.as_ref().unwrap()[26..].to_vec();
-
-        let identity = FfiIdentifier {
-            identifier: hex::encode(public_key.clone()),
-            identifier_kind: FfiIdentifierKind::Passkey,
-        };
-
-        let nonce = 0;
-        let inbox_id = identity.inbox_id(nonce).unwrap();
-
-        let db_path = tmp_path();
-        let db_enc_key = static_enc_key().to_vec();
-
-        let client = create_client(
-            connect_to_backend(xmtp_api_grpc::LOCALHOST_ADDRESS.to_string(), false)
-                .await
-                .unwrap(),
-            Some(db_path),
-            Some(db_enc_key),
-            &inbox_id,
-            identity,
-            nonce,
-            None,
-            None,
-        )
-        .await
-        .unwrap();
-
-        let conn = client.inner_client.context().store().conn().unwrap();
-        conn.register_triggers();
-
-        let signature_request = client.signature_request().unwrap();
-        let challenge = signature_request
-            .signature_text()
-            .await
-            .unwrap()
-            .as_bytes()
-            .to_vec();
-        let sign_request = CredentialRequestOptions {
-            public_key: PublicKeyCredentialRequestOptions {
-                challenge: Bytes::from(challenge),
-                timeout: None,
-                rp_id: Some(String::from(origin.domain().unwrap())),
-                allow_credentials: None,
-                user_verification: UserVerificationRequirement::default(),
-                hints: None,
-                attestation: AttestationConveyancePreference::None,
-                attestation_formats: None,
-                extensions: None,
-            },
-        };
-
-        let cred = pk_client
-            .authenticate(origin.clone(), sign_request, DefaultClientData)
-            .await
-            .unwrap();
-        let resp = cred.response;
-
-        let signature = resp.signature.to_vec();
-
-        signature_request
-            .add_passkey_signature(FfiPasskeySignature {
-                public_key,
-                signature,
-                client_data_json: resp.client_data_json.to_vec(),
-                authenticator_data: resp.authenticator_data.to_vec(),
-            })
-            .await
-            .unwrap();
-        client.register_identity(signature_request).await.unwrap();
-
-        PasskeyUser {
-            pk_client,
-            pk_cred,
-            client,
-        }
-    }
-
     async fn new_test_client() -> Arc<FfiXmtpClient> {
         let wallet = xmtp_cryptography::utils::LocalWallet::new(&mut rng());
         new_test_client_with_wallet(wallet).await
     }
 
+    async fn new_test_client_no_sync() -> Arc<FfiXmtpClient> {
+        let wallet = xmtp_cryptography::utils::LocalWallet::new(&mut rng());
+        new_test_client_with_wallet_and_history_sync_url(
+            wallet,
+            None,
+            Some(FfiSyncWorkerMode::Disabled),
+        )
+        .await
+    }
+
     async fn new_test_client_with_history() -> Arc<FfiXmtpClient> {
         let wallet = xmtp_cryptography::utils::LocalWallet::new(&mut rng());
-        new_test_client_with_wallet_and_history_sync_url(wallet, Some(HISTORY_SYNC_URL.to_string()))
-            .await
+        new_test_client_with_wallet_and_history_sync_url(
+            wallet,
+            Some(HISTORY_SYNC_URL.to_string()),
+            None,
+        )
+        .await
     }
 
     impl FfiConversation {
@@ -3286,6 +3149,7 @@ mod tests {
             nonce,
             Some(legacy_keys),
             None,
+            None,
         )
         .await
         .unwrap();
@@ -3295,7 +3159,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn test_create_client_with_storage() {
-        let ffi_inbox_owner = LocalWalletInboxOwner::new();
+        let ffi_inbox_owner = FfiWalletInboxOwner::new();
         let ident = ffi_inbox_owner.identifier();
         let nonce = 1;
         let inbox_id = ident.inbox_id(nonce).unwrap();
@@ -3311,6 +3175,7 @@ mod tests {
             &inbox_id,
             ffi_inbox_owner.identifier(),
             nonce,
+            None,
             None,
             None,
         )
@@ -3332,6 +3197,7 @@ mod tests {
             nonce,
             None,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -3347,7 +3213,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn test_create_client_with_key() {
-        let ffi_inbox_owner = LocalWalletInboxOwner::new();
+        let ffi_inbox_owner = FfiWalletInboxOwner::new();
         let nonce = 1;
         let ident = ffi_inbox_owner.identifier();
         let inbox_id = ident.inbox_id(nonce).unwrap();
@@ -3365,6 +3231,7 @@ mod tests {
             &inbox_id,
             ffi_inbox_owner.identifier(),
             nonce,
+            None,
             None,
             None,
         )
@@ -3387,6 +3254,7 @@ mod tests {
             nonce,
             None,
             None,
+            None,
         )
         .await
         .is_err();
@@ -3402,17 +3270,11 @@ mod tests {
     impl SignWithWallet for FfiSignatureRequest {
         async fn add_wallet_signature(&self, wallet: &xmtp_cryptography::utils::LocalWallet) {
             let signature_text = self.inner.lock().await.signature_text();
-            let wallet_signature: Vec<u8> = wallet.sign(&signature_text.clone()).unwrap().into();
 
             self.inner
                 .lock()
                 .await
-                .add_signature(
-                    UnverifiedSignature::RecoverableEcdsa(
-                        UnverifiedRecoverableEcdsaSignature::new(wallet_signature),
-                    ),
-                    &self.scw_verifier,
-                )
+                .add_signature(wallet.sign(&signature_text).unwrap(), &self.scw_verifier)
                 .await
                 .unwrap();
         }
@@ -3422,7 +3284,13 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn radio_silence() {
-        let alex = new_passkey_client().await;
+        let alex = Tester::builder()
+            .with_sync_worker()
+            .with_sync_server()
+            .build()
+            .await;
+        let worker = alex.client.inner_client.worker_handle().unwrap();
+        worker.wait(SyncMetric::V1RequestSent, 1).await.unwrap();
 
         let stats = alex.inner_client.api_stats();
         let ident_stats = alex.inner_client.identity_api_stats();
@@ -3430,7 +3298,7 @@ mod tests {
         // One identity update pushed. Zero interaction with groups.
         assert_eq!(ident_stats.publish_identity_update.get_count(), 1);
         assert_eq!(stats.send_welcome_messages.get_count(), 0);
-        assert_eq!(stats.send_group_messages.get_count(), 0);
+        assert_eq!(stats.send_group_messages.get_count(), 3);
 
         let bo = new_test_client();
         let conversation = alex
@@ -3441,15 +3309,15 @@ mod tests {
             )
             .await
             .unwrap();
-
         conversation.send(b"Hello there".to_vec()).await.unwrap();
+        worker.wait(SyncMetric::V1ConsentSent, 1).await.unwrap();
+        worker.wait(SyncMetric::V1HmacSent, 1).await.unwrap();
 
         // One identity update pushed. Zero interaction with groups.
         assert_eq!(ident_stats.publish_identity_update.get_count(), 1);
-        // Why is this 2?
         assert_eq!(ident_stats.get_inbox_ids.get_count(), 2);
         assert_eq!(stats.send_welcome_messages.get_count(), 1);
-        assert_eq!(stats.send_group_messages.get_count(), 2);
+        let group_message_count = stats.send_group_messages.get_count();
 
         // Sleep for 2 seconds and make sure nothing else has sent
         tokio::time::sleep(Duration::from_secs(2)).await;
@@ -3458,13 +3326,13 @@ mod tests {
         assert_eq!(ident_stats.publish_identity_update.get_count(), 1);
         assert_eq!(ident_stats.get_inbox_ids.get_count(), 2);
         assert_eq!(stats.send_welcome_messages.get_count(), 1);
-        assert_eq!(stats.send_group_messages.get_count(), 2);
+        assert_eq!(stats.send_group_messages.get_count(), group_message_count);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn test_can_add_wallet_to_inbox() {
         // Setup the initial first client
-        let ffi_inbox_owner = LocalWalletInboxOwner::new();
+        let ffi_inbox_owner = FfiWalletInboxOwner::new();
         let ident = ffi_inbox_owner.identifier();
         let nonce = 1;
         let inbox_id = ident.inbox_id(nonce).unwrap();
@@ -3480,6 +3348,7 @@ mod tests {
             &inbox_id,
             ffi_inbox_owner.identifier(),
             nonce,
+            None,
             None,
             None,
         )
@@ -3550,114 +3419,26 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
-    async fn associate_passkey() {
+    async fn test_associate_passkey() {
         let alex = new_test_client().await;
-
-        let origin = url::Url::parse("https://xmtp.chat").expect("Should parse");
-        let parameters_from_rp = PublicKeyCredentialParameters {
-            ty: PublicKeyCredentialType::PublicKey,
-            alg: coset::iana::Algorithm::ES256,
-        };
-        let pk_user_entity = PublicKeyCredentialUserEntity {
-            id: random_vec(32).into(),
-            display_name: "Alex Passkey".into(),
-            name: "apk@example.org".into(),
-        };
-        let pk_auth_store: Option<Passkey> = None;
-        let pk_aaguid = Aaguid::new_empty();
-        let pk_user_validation_method = PkUserValidationMethod {};
-        let pk_auth = Authenticator::new(pk_aaguid, pk_auth_store, pk_user_validation_method);
-        let mut pk_client = Client::new(pk_auth);
-
-        let request = CredentialCreationOptions {
-            public_key: PublicKeyCredentialCreationOptions {
-                rp: PublicKeyCredentialRpEntity {
-                    id: None, // Leaving the ID as None means use the effective domain
-                    name: origin.domain().unwrap().into(),
-                },
-                user: pk_user_entity,
-                // We're not passing a challenge here because we don't care about the credential and the user_entity behind it (for now).
-                // It's guaranteed to be unique, and that's good enough for us.
-                // All we care about is if that unique credential signs below.
-                challenge: Bytes::from(vec![]),
-                pub_key_cred_params: vec![parameters_from_rp],
-                timeout: None,
-                exclude_credentials: None,
-                authenticator_selection: None,
-                hints: None,
-                attestation: AttestationConveyancePreference::None,
-                attestation_formats: None,
-                extensions: None,
-            },
-        };
-
-        // Now create the credential.
-        let my_webauthn_credential = pk_client
-            .register(origin.clone(), request, DefaultClientData)
-            .await
-            .unwrap();
-
-        let public_key = my_webauthn_credential.response.public_key.unwrap().to_vec();
-        let public_key = public_key[26..].to_vec();
+        let passkey = PasskeyUser::new().await;
 
         let sig_request = alex
-            .add_identity(FfiIdentifier {
-                identifier: hex::encode(&public_key),
-                identifier_kind: FfiIdentifierKind::Passkey,
-            })
+            .add_identity(passkey.identifier().into())
             .await
             .unwrap();
-
         let challenge = sig_request.signature_text().await.unwrap();
-        let challenge_bytes = challenge.as_bytes().to_vec();
-
-        let request = CredentialRequestOptions {
-            public_key: PublicKeyCredentialRequestOptions {
-                challenge: Bytes::from(challenge_bytes),
-                timeout: None,
-                rp_id: Some(String::from(origin.domain().unwrap())),
-                allow_credentials: None,
-                user_verification: UserVerificationRequirement::default(),
-                hints: None,
-                attestation: AttestationConveyancePreference::None,
-                attestation_formats: None,
-                extensions: None,
-            },
+        let UnverifiedSignature::Passkey(sig) = passkey.sign(&challenge).unwrap() else {
+            unreachable!()
         };
-
-        let cred = pk_client
-            .authenticate(origin.clone(), request, DefaultClientData)
-            .await
-            .unwrap();
-        let resp = cred.response;
-
-        let mut signature = resp.signature.to_vec();
-
-        // Try to add a bad sig first
-        // Corrupt the sig
-        signature[4] = signature[4].wrapping_add(1);
-        let result = sig_request
-            .add_passkey_signature(FfiPasskeySignature {
-                authenticator_data: resp.authenticator_data.to_vec(),
-                signature: signature.clone(),
-                client_data_json: resp.client_data_json.to_vec(),
-                public_key: public_key.clone(),
-            })
-            .await;
-        // It should not verify
-        assert!(result.is_err());
-
-        // un-corrupt the sig
-        signature[4] = signature[4].wrapping_sub(1);
         sig_request
             .add_passkey_signature(FfiPasskeySignature {
-                authenticator_data: resp.authenticator_data.to_vec(),
-                signature: signature.clone(),
-                client_data_json: resp.client_data_json.to_vec(),
-                public_key: public_key.clone(),
+                public_key: sig.public_key,
+                signature: sig.signature,
+                authenticator_data: sig.authenticator_data,
+                client_data_json: sig.client_data_json,
             })
             .await
-            // should be good
             .unwrap();
 
         alex.apply_signature_request(sig_request).await.unwrap();
@@ -3666,7 +3447,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn test_can_revoke_wallet() {
         // Setup the initial first client
-        let ffi_inbox_owner = LocalWalletInboxOwner::new();
+        let ffi_inbox_owner = FfiWalletInboxOwner::new();
         let nonce = 1;
         let ident = ffi_inbox_owner.identifier();
         let inbox_id = ident.inbox_id(nonce).unwrap();
@@ -3682,6 +3463,7 @@ mod tests {
             &inbox_id,
             ffi_inbox_owner.identifier(),
             nonce,
+            None,
             None,
             None,
         )
@@ -3756,7 +3538,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn test_invalid_external_signature() {
-        let inbox_owner = LocalWalletInboxOwner::new();
+        let inbox_owner = FfiWalletInboxOwner::new();
         let ident = inbox_owner.identifier();
         let nonce = 1;
         let inbox_id = ident.inbox_id(nonce).unwrap();
@@ -3773,6 +3555,7 @@ mod tests {
             nonce,
             None, // v2_signed_private_key_proto
             None,
+            None,
         )
         .await
         .unwrap();
@@ -3783,12 +3566,12 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn test_can_message() {
-        let amal = LocalWalletInboxOwner::new();
+        let amal = FfiWalletInboxOwner::new();
         let amal_ident = amal.identifier();
         let nonce = 1;
         let amal_inbox_id = amal_ident.inbox_id(nonce).unwrap();
 
-        let bola = LocalWalletInboxOwner::new();
+        let bola = FfiWalletInboxOwner::new();
         let bola_ident = bola.identifier();
         let bola_inbox_id = bola_ident.inbox_id(nonce).unwrap();
         let path = tmp_path();
@@ -3802,6 +3585,7 @@ mod tests {
             &amal_inbox_id,
             amal.identifier(),
             nonce,
+            None,
             None,
             None,
         )
@@ -3844,6 +3628,7 @@ mod tests {
             nonce,
             None,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -3865,8 +3650,8 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn test_create_group_with_members() {
-        let amal = new_test_client().await;
-        let bola = new_test_client().await;
+        let amal = Tester::new().await;
+        let bola = Tester::new().await;
 
         let group = amal
             .conversations()
@@ -4107,8 +3892,8 @@ mod tests {
     // Looks like this test might be a separate issue
     #[tokio::test(flavor = "multi_thread", worker_threads = 5)]
     async fn test_can_stream_group_messages_for_updates() {
-        let alix = new_test_client().await;
-        let bo = new_test_client().await;
+        let alix = new_test_client_no_sync().await;
+        let bo = new_test_client_no_sync().await;
         let alix_provider = alix.inner_client.mls_provider().unwrap();
         let bo_provider = bo.inner_client.mls_provider().unwrap();
 
@@ -4145,7 +3930,7 @@ mod tests {
 
         // alix published + processed group creation and name update
         assert_eq!(alix_provider.conn_ref().intents_published(), 2);
-        assert_eq!(alix_provider.conn_ref().intents_deleted(), 2);
+        assert_eq!(alix_provider.conn_ref().intents_processed(), 2);
 
         bo_group
             .conversation
@@ -6051,8 +5836,8 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 5)]
     async fn test_group_creation_custom_permissions() {
-        let alix = new_test_client().await;
-        let bola = new_test_client().await;
+        let alix = Tester::new().await;
+        let bola = Tester::new().await;
 
         let custom_permissions = FfiPermissionPolicySet {
             add_admin_policy: FfiPermissionPolicy::Admin,
@@ -6161,8 +5946,8 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 5)]
     async fn test_group_creation_custom_permissions_fails_when_invalid() {
-        let alix = new_test_client().await;
-        let bola = new_test_client().await;
+        let alix = Tester::new().await;
+        let bola = Tester::new().await;
 
         // Add / Remove Admin must be Admin or Super Admin or Deny
         let custom_permissions_invalid_1 = FfiPermissionPolicySet {
@@ -6371,8 +6156,8 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 5)]
     async fn test_dms_sync_but_do_not_list() {
-        let alix = new_test_client().await;
-        let bola = new_test_client().await;
+        let alix = Tester::new().await;
+        let bola = Tester::new().await;
 
         let alix_conversations = alix.conversations();
         let bola_conversations = bola.conversations();
@@ -6429,9 +6214,9 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 5)]
     async fn test_dm_streaming() {
-        let alix = new_test_client().await;
-        let bo = new_test_client().await;
-        let caro = new_test_client().await;
+        let alix = Tester::new().await;
+        let bo = Tester::new().await;
+        let caro = Tester::new().await;
 
         // Stream all conversations
         let stream_callback = Arc::new(RustStreamCallback::default());
@@ -6517,8 +6302,8 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 5)]
     async fn test_stream_all_dm_messages() {
-        let alix = new_test_client().await;
-        let bo = new_test_client().await;
+        let alix = Tester::new().await;
+        let bo = Tester::new().await;
         let alix_dm = alix
             .conversations()
             .find_or_create_dm(bo.account_identifier.clone(), FfiCreateDMOptions::default())
@@ -6599,13 +6384,14 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 5)]
     async fn test_stream_consent() {
-        let wallet = generate_local_wallet();
-        let alix_a = new_test_client_with_wallet_and_history(wallet.clone()).await;
-        let alix_a_conn = alix_a.inner_client.store().conn().unwrap();
-        // wait for alix_a's sync worker to create a sync group
-        let _ = wait_for_ok(|| async { alix_a.inner_client.get_sync_group(&alix_a_conn) }).await;
+        let alix_a = Tester::builder().with_sync_worker().build().await;
 
-        let alix_b = new_test_client_with_wallet_and_history(wallet).await;
+        // wait for alix_a's sync worker to create a sync group
+        let _ =
+            wait_for_ok(|| async { alix_a.inner_client.get_sync_group(&alix_a.provider) }).await;
+
+        let alix_b = alix_a.builder.build().await;
+
         wait_for_eq(|| async { alix_b.inner_client.identity().is_ready() }, true)
             .await
             .unwrap();
@@ -6690,16 +6476,20 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 5)]
     async fn test_stream_preferences() {
-        let wallet = generate_local_wallet();
-        let alix_a = new_test_client_with_wallet_and_history(wallet.clone()).await;
+        let alix = Tester::builder()
+            .with_sync_worker()
+            .with_sync_server()
+            .do_not_wait_for_init()
+            .build()
+            .await;
         let stream_a_callback = Arc::new(RustStreamCallback::default());
 
-        let a_stream = alix_a
+        let a_stream = alix
             .conversations()
             .stream_preferences(stream_a_callback.clone())
             .await;
 
-        let _alix_b = new_test_client_with_wallet_and_history(wallet).await;
+        let _alix_b = alix.builder.build().await;
 
         let result = stream_a_callback.wait_for_delivery(Some(3)).await;
         assert!(result.is_ok());
@@ -6983,10 +6773,11 @@ mod tests {
             1,
             None,
             Some(HISTORY_SYNC_URL.to_string()),
+            None,
         )
         .await
         .unwrap();
-        let ffi_inbox_owner = LocalWalletInboxOwner::with_wallet(wallet_a.clone());
+        let ffi_inbox_owner = FfiWalletInboxOwner::with_wallet(wallet_a.clone());
         register_client(&ffi_inbox_owner, &client_a).await;
 
         // Step 3: Generate wallet B
@@ -7022,10 +6813,11 @@ mod tests {
             nonce,
             None,
             Some(HISTORY_SYNC_URL.to_string()),
+            None,
         )
         .await
         .unwrap();
-        let ffi_inbox_owner = LocalWalletInboxOwner::with_wallet(wallet_b.clone());
+        let ffi_inbox_owner = FfiWalletInboxOwner::with_wallet(wallet_b.clone());
         register_client(&ffi_inbox_owner, &client_b).await;
 
         assert!(client_b.inbox_id() == client_a.inbox_id());
@@ -7086,6 +6878,7 @@ mod tests {
             nonce,
             None,
             Some(HISTORY_SYNC_URL.to_string()),
+            None,
         )
         .await;
 
@@ -7121,10 +6914,11 @@ mod tests {
             1,
             None,
             Some(HISTORY_SYNC_URL.to_string()),
+            None,
         )
         .await
         .unwrap();
-        let ffi_inbox_owner_a = LocalWalletInboxOwner::with_wallet(wallet_a.clone());
+        let ffi_inbox_owner_a = FfiWalletInboxOwner::with_wallet(wallet_a.clone());
         register_client(&ffi_inbox_owner_a, &client_a).await;
 
         // Step 2: Wallet B creates a new client with inbox_id B
@@ -7143,10 +6937,11 @@ mod tests {
             1,
             None,
             Some(HISTORY_SYNC_URL.to_string()),
+            None,
         )
         .await
         .unwrap();
-        let ffi_inbox_owner_b1 = LocalWalletInboxOwner::with_wallet(wallet_b.clone());
+        let ffi_inbox_owner_b1 = FfiWalletInboxOwner::with_wallet(wallet_b.clone());
         register_client(&ffi_inbox_owner_b1, &client_b1).await;
 
         // Step 3: Wallet B creates a second client for inbox_id B
@@ -7162,6 +6957,7 @@ mod tests {
             1,
             None,
             Some(HISTORY_SYNC_URL.to_string()),
+            None,
         )
         .await
         .unwrap();
@@ -7192,6 +6988,7 @@ mod tests {
             1,
             None,
             Some(HISTORY_SYNC_URL.to_string()),
+            None,
         )
         .await;
 
@@ -7889,7 +7686,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 5)]
     async fn test_key_package_validation() {
         // Create a test client
-        let client = new_test_client().await;
+        let client = Tester::new().await;
 
         // Get the client's inbox state to retrieve installation IDs
         let inbox_state = client.inbox_state(true).await.unwrap();
@@ -7961,5 +7758,90 @@ mod tests {
                 println!("No lifetime for this key package")
             }
         }
+    }
+
+    #[tokio::test]
+    async fn test_sync_consent() {
+        // Create two test users
+        let alix = Tester::builder()
+            .with_sync_server()
+            .with_sync_worker()
+            .build()
+            .await;
+        let bo = Tester::new().await;
+
+        // Create a group conversation
+        let alix_group = alix
+            .conversations()
+            .create_group_with_inbox_ids(vec![bo.inbox_id()], FfiCreateGroupOptions::default())
+            .await
+            .unwrap();
+        let initial_consent = alix_group.consent_state().unwrap();
+        assert_eq!(initial_consent, FfiConsentState::Allowed);
+
+        let alix2 = alix.builder.build().await;
+
+        let state = alix2.inbox_state(true).await.unwrap();
+        assert_eq!(state.installations.len(), 2);
+
+        alix.conversations()
+            .sync_all_conversations(None)
+            .await
+            .unwrap();
+        alix2
+            .conversations()
+            .sync_all_conversations(None)
+            .await
+            .unwrap();
+
+        let sg1 = alix
+            .inner_client
+            .get_sync_group(&alix.inner_client.mls_provider().unwrap())
+            .unwrap();
+        let sg2 = alix2
+            .inner_client
+            .get_sync_group(&alix2.inner_client.mls_provider().unwrap())
+            .unwrap();
+
+        assert_eq!(sg1.group_id, sg2.group_id);
+
+        alix.conversations()
+            .sync_all_conversations(None)
+            .await
+            .unwrap();
+        alix2
+            .conversations()
+            .sync_all_conversations(None)
+            .await
+            .unwrap();
+
+        alix2
+            .inner_client
+            .sync_welcomes(&alix2.inner_client.mls_provider().unwrap())
+            .await
+            .unwrap();
+
+        // Update consent state
+        alix_group
+            .update_consent_state(FfiConsentState::Denied)
+            .unwrap();
+        alix.worker()
+            .wait(SyncMetric::V1ConsentSent, 2)
+            .await
+            .unwrap();
+
+        sg2.sync().await.unwrap();
+
+        alix2
+            .worker()
+            .wait(SyncMetric::V1ConsentReceived, 1)
+            .await
+            .unwrap();
+
+        let alix_group2 = alix2.conversation(alix_group.id()).unwrap();
+        assert_eq!(
+            alix_group2.consent_state().unwrap(),
+            FfiConsentState::Denied
+        );
     }
 }
